@@ -12,6 +12,14 @@ const url = require('url');
 
 const isOk = response => response.ok() || response.status() === 304;
 
+const addAll = (_set, items) => {
+  // check set and items
+  for (let it of items) {
+    _set.add(it);
+  }
+  return _set;
+};
+
 /**
  * Take in a csstree AST, mutate it and return a csstree AST.
  * The mutation is about:
@@ -159,7 +167,8 @@ const processPage = ({
   doms,
   allHrefs,
   redirectResponses,
-  skippedUrls
+  skippedUrls,
+  criticalTags
 }) =>
   new Promise(async (resolve, reject) => {
     // If anything goes wrong, for example a `pageerror` event or
@@ -189,6 +198,7 @@ const processPage = ({
     const debug = options.debug || false;
     const loadimages = options.loadimages || false;
     const styletags = options.styletags || false;
+    const returncriticaltags = options.returncriticaltags || false;
     const withoutjavascript =
       options.withoutjavascript === undefined
         ? true
@@ -290,6 +300,47 @@ const processPage = ({
         if (!isOk(response)) {
           return safeReject(new Error(`${response.status()} on ${pageUrl}`));
         }
+
+        // If it was requested to include the critical DOM
+        // elements along with the response, grab them from
+        // the page obj here.
+        //
+        // It's important to note, at this point in the logic
+        // flow, the `criticalTags` object contains _more_ than
+        // just the critical tags.  We will filter out a result-
+        // ing array after minimalCss completes it's determinations.
+        if (returncriticaltags) {
+          let attrObj = {};
+
+          // Wrap the the `page.evaluate` call in a helper
+          // method that individually appends the returned array
+          // values onto the `criticalTags` Set.
+          addAll(
+            criticalTags,
+            await page.evaluate(criticalTags => {
+              let tags = [
+                document.querySelectorAll('link'),
+                document.querySelectorAll('style')
+              ];
+
+              return tags
+                .map(function(NodeList) {
+                  return [].map.call(NodeList, Node => {
+                    // refresh object, starting w/ elem tag name.
+                    attrObj = { tagName: Node.tagName };
+                    // get elem attributes.
+                    Node.getAttributeNames().forEach(name => {
+                      attrObj[name] = Node.getAttribute(name);
+                    });
+                    // return attribs obj.
+                    return attrObj;
+                  });
+                })
+                .flat();
+            }, criticalTags)
+          );
+        }
+
         const htmlVanilla = await page.content();
         doms.push(cheerio.load(htmlVanilla));
         await page.setJavaScriptEnabled(true);
@@ -433,6 +484,7 @@ const minimalcss = async options => {
   const allHrefs = [];
   const redirectResponses = {};
   const skippedUrls = new Set();
+  const criticalTags = new Set();
 
   try {
     // Note! This opens one URL at a time synchronous
@@ -452,7 +504,8 @@ const minimalcss = async options => {
           doms,
           allHrefs,
           redirectResponses,
-          skippedUrls
+          skippedUrls,
+          criticalTags
         });
       } catch (e) {
         throw e;
@@ -613,9 +666,32 @@ const minimalcss = async options => {
   csso.compress(allCombinedAst, cssoOptions);
   postProcessOptimize(allCombinedAst);
 
+  // Remove any tag/elem objects from the `criticalTags`
+  // Set that does not have a href/src in the `allusedHrefs`
+  // array.  We only need to return the tag/elems that
+  // are _critical_.
+  const usedCriticalTags = [];
+  criticalTags.forEach(function(cTag) {
+    // pessimist checking.
+    if (typeof cTag !== 'object') {
+      return false;
+    }
+    // find property, evaluate for existance
+    // in `allusedHrefs`.
+    if (cTag.hasOwnProperty('href') && allUsedHrefs.indexOf(cTag.href) > -1) {
+      usedCriticalTags.push(cTag);
+    } else if (
+      cTag.hasOwnProperty('src') &&
+      allUsedHrefs.indexOf(cTag.src) > -1
+    ) {
+      usedCriticalTags.push(cTag);
+    }
+  });
+
   const returned = {
     finalCss: csstree.generate(allCombinedAst),
-    stylesheetContents
+    stylesheetContents,
+    criticalTags: usedCriticalTags
   };
   return Promise.resolve(returned);
 };
